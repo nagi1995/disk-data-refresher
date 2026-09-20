@@ -1,6 +1,4 @@
-
 from __future__ import annotations
-from dataclasses import dataclass, field
 
 import argparse
 import hashlib
@@ -12,36 +10,129 @@ import stat
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-_ATOMIC_REPLACE = os.replace
 
+# ============================================================
+# Configuration
+# ============================================================
+
+SAFETY_MARGIN_GB = 2
+HASH_CHUNK_SIZE = 128 * 1024 * 1024
+
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
+# Save manifest periodically rather than after every file.
+# This is important for HDD performance.
+MANIFEST_CHECKPOINT_FILES = 50
+
+SKIP_DIRS = {
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "Config.Msi",
+}
+
+TEMP_SUFFIX = ".refreshtmp"
+
+MANIFEST_VERSION = 2
+
+DEFAULT_MANIFEST_NAME = "refresh_manifest.json"
+DEFAULT_LOG_NAME = "refresh.log"
+
+
+# ============================================================
+# Status / failure constants
+# ============================================================
+
+PENDING = "PENDING"
+IN_PROGRESS = "IN_PROGRESS"
+COMPLETED = "COMPLETED"
+FAILED = "FAILED"
+
+NO_SPACE = "NO_SPACE"
+PERMISSION = "PERMISSION"
+SOURCE_CHANGED = "SOURCE_CHANGED"
+TEMP_VERIFY = "TEMP_VERIFY"
+METADATA_VERIFY = "METADATA_VERIFY"
+REPLACE = "REPLACE"
+MISSING_SOURCE = "MISSING_SOURCE"
+MANIFEST_MISMATCH = "MANIFEST_MISMATCH"
+ERROR = "ERROR"
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+logger = logging.getLogger("refresh")
+
+
+def setup_logging(log_path: Path) -> None:
+    """
+    Configure console + file logging.
+
+    The log file is outside the input directory by default because
+    it is created relative to the current working directory.
+    """
+
+    log_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    logger.setLevel(logging.INFO)
+
+    # Avoid duplicate handlers if setup_logging() is called again.
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s"
+    )
+
+    file_handler = logging.FileHandler(
+        log_path,
+        encoding="utf-8",
+    )
+
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+
+# ============================================================
+# Validation result
+# ============================================================
 
 @dataclass
 class ValidationResult:
-    # File inventory
     expected_files: int = 0
     present_files: int = 0
     verified_files: int = 0
 
     missing_files: int = 0
     unexpected_files: int = 0
+
     size_mismatches: int = 0
     hash_mismatches: int = 0
+
     validation_errors: int = 0
 
-    # Directory inventory
     expected_directories: int = 0
     present_directories: int = 0
     missing_directories: int = 0
     unexpected_directories: int = 0
 
-    # Temporary artifacts
     temporary_files: int = 0
 
-    # Detailed diagnostics
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -67,107 +158,29 @@ class ValidationResult:
             "errors": list(self.errors),
         }
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
-SAFETY_MARGIN_GB = 2
-HASH_CHUNK_SIZE = 8 * 1024 * 1024
-MAX_RETRIES = 3
-RETRY_DELAY = 5
+# ============================================================
+# Basic helpers
+# ============================================================
 
-SKIP_DIRS = {
-    "$RECYCLE.BIN",
-    "System Volume Information",
-    "Config.Msi",
-}
-
-TEMP_SUFFIX = ".refreshtmp"
-MANIFEST_VERSION = 2
+def is_regular_file(path: Path) -> bool:
+    try:
+        return path.is_file() and not path.is_symlink()
+    except OSError:
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Status / failure codes
-# ---------------------------------------------------------------------------
-
-STATUS_PENDING = "PENDING"
-STATUS_IN_PROGRESS = "IN_PROGRESS"
-STATUS_COMPLETED = "COMPLETED"
-STATUS_FAILED = "FAILED"
-
-FAIL_NO_SPACE = "NO_SPACE"
-FAIL_PERMISSION = "PERMISSION"
-FAIL_SOURCE_CHANGED = "SOURCE_CHANGED"
-FAIL_TEMP_VERIFY = "TEMP_VERIFY"
-FAIL_METADATA_VERIFY = "METADATA_VERIFY"
-FAIL_REPLACE = "REPLACE"
-FAIL_MISSING_SOURCE = "MISSING_SOURCE"
-FAIL_MANIFEST_MISMATCH = "MANIFEST_MISMATCH"
-FAIL_ERROR = "ERROR"
+def relative_path(root: Path, path: Path) -> str:
+    return path.relative_to(root).as_posix()
 
 
-logger = logging.getLogger("refresh")
-
-
-# ---------------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------------
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def configure_logging(log_path: Optional[Path] = None) -> None:
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    )
-    logger.addHandler(console)
-
-    if log_path:
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        )
-        logger.addHandler(file_handler)
-
-
-def get_free_gb(path: Path) -> float:
-    return shutil.disk_usage(path).free / (1024 ** 3)
-
-
-def get_file_signature(path: Path) -> tuple[int, int]:
-    st = path.stat()
-    return st.st_size, st.st_mtime_ns
-
-
-# ---------------------------------------------------------------------------
-# Read-only handling
-# ---------------------------------------------------------------------------
-
-def is_readonly(path: Path) -> bool:
-    return not bool(path.stat().st_mode & stat.S_IWRITE)
-
-
-def set_readonly(path: Path, readonly: bool) -> None:
-    mode = path.stat().st_mode
-
-    if readonly:
-        path.chmod(mode & ~stat.S_IWRITE)
-    else:
-        path.chmod(mode | stat.S_IWRITE)
-
-
-# ---------------------------------------------------------------------------
-# Hash / copy / durability
-# ---------------------------------------------------------------------------
+# ============================================================
+# Hashing
+# ============================================================
 
 def sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
-    # logger.info(f"started computing sha256 for {path}")
+
     with path.open("rb") as f:
         while True:
             chunk = f.read(HASH_CHUNK_SIZE)
@@ -176,800 +189,1145 @@ def sha256_of(path: Path) -> str:
                 break
 
             digest.update(chunk)
-    # logger.info(f"completed computing sha256 for {path}")
+
     return digest.hexdigest()
 
 
+# ============================================================
+# File durability
+# ============================================================
+
 def fsync_file(path: Path) -> None:
-    # Windows requires a writable handle for fsync/FlushFileBuffers.
     with path.open("r+b") as f:
         f.flush()
         os.fsync(f.fileno())
 
 
-def copy_writethrough(source: Path, target: Path) -> None:
-    shutil.copy2(source, target)
+def copy_writethrough(
+    source: Path,
+    target: Path,
+) -> None:
+    """
+    copy2() preserves normal metadata and may use platform
+    optimized copy mechanisms.
+
+    fsync() ensures the copied file is flushed before validation.
+    """
+
+    shutil.copy2(
+        source,
+        target,
+    )
+
     fsync_file(target)
 
 
-def preserve_metadata(source: Path, target: Path) -> None:
-    shutil.copystat(source, target, follow_symlinks=False)
-
-
-# ---------------------------------------------------------------------------
-# Temporary file helpers
-# ---------------------------------------------------------------------------
-
-def temp_path_for(source: Path) -> Path:
-    return source.with_name(source.name + TEMP_SUFFIX)
-
-
-def remove_temp_file(path: Path) -> None:
-    try:
-        if path.exists() or path.is_symlink():
-            path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Manifest persistence
-# ---------------------------------------------------------------------------
-
-def manifest_path_for(root: Path) -> Path:
-    return root / "refresh-manifest.json"
-
-
-def _atomic_json_write(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    fd, temp_name = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(path.parent),
-        text=True,
-    )
-
-    temp = Path(temp_name)
-
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-
-        _ATOMIC_REPLACE(temp, path)
-
-    finally:
-        if temp.exists():
-            temp.unlink()
-
+# ============================================================
+# Manifest
+# ============================================================
 
 def save_manifest(
     manifest_path: Path,
     manifest: dict[str, Any],
 ) -> None:
-    manifest["updated_at"] = utc_now()
-    _atomic_json_write(manifest_path, manifest)
+    """
+    Atomically write the manifest.
+
+    The manifest lives outside the input tree by default.
+    """
+
+    manifest_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=manifest_path.name + ".",
+        suffix=".tmp",
+        dir=manifest_path.parent,
+        text=True,
+    )
+
+    tmp_path = Path(tmp_name)
+
+    try:
+
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            json.dump(
+                manifest,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(
+            tmp_path,
+            manifest_path,
+        )
+
+    finally:
+
+        try:
+            tmp_path.unlink(
+                missing_ok=True
+            )
+        except OSError:
+            pass
 
 
-def load_manifest(manifest_path: Path) -> dict[str, Any]:
-    with manifest_path.open("r", encoding="utf-8") as f:
+def load_manifest(
+    manifest_path: Path,
+) -> dict[str, Any]:
+
+    with manifest_path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
         manifest = json.load(f)
 
-    if manifest.get("format_version") != MANIFEST_VERSION:
-        raise ValueError("Unsupported manifest format version")
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise ValueError(
+            f"Unsupported manifest version: "
+            f"{manifest.get('version')!r}"
+        )
+
+    if "files" not in manifest:
+        raise ValueError(
+            "Manifest is missing 'files'."
+        )
+
+    if "directories" not in manifest:
+        raise ValueError(
+            "Manifest is missing 'directories'."
+        )
 
     return manifest
 
 
-def validate_manifest_root(
-    root: Path,
-    manifest: dict[str, Any],
-) -> None:
-    actual = root.resolve()
-    expected = Path(manifest["root"]).resolve()
-
-    if actual != expected:
-        raise ValueError(
-            f"Manifest belongs to {expected}, not {actual}"
-        )
-
-
-# ---------------------------------------------------------------------------
+# ============================================================
 # Manifest creation
-# ---------------------------------------------------------------------------
+# ============================================================
 
-def relative_key(root: Path, path: Path) -> str:
-    return path.relative_to(root).as_posix()
+def create_manifest(
+    root: Path,
+) -> dict[str, Any]:
 
-
-def create_manifest(root: Path) -> dict[str, Any]:
     root = root.resolve()
 
-    if not root.exists() or not root.is_dir():
-        raise ValueError(f"Path is not a directory: {root}")
-
-    files: dict[str, Any] = {}
-    directories: list[str] = []
-
-    for current, dirnames, filenames in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current_path = Path(current)
-
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d not in SKIP_DIRS
-            and not (current_path / d).is_symlink()
-        ]
-
-        if current_path != root:
-            directories.append(
-                relative_key(root, current_path)
-            )
-
-        for name in filenames:
-            path = current_path / name
-
-            if path.is_symlink() or not path.is_file():
-                continue
-
-            relative = relative_key(root, path)
-            stat_result = path.stat()
-
-            files[relative] = {
-                "size": stat_result.st_size,
-                "mtime_ns": stat_result.st_mtime_ns,
-                "sha256": sha256_of(path),
-                "status": STATUS_PENDING,
-                "attempts": 0,
-                "last_error": None,
-                "last_error_detail": None,
-            }
-
-    return {
-        "format_version": MANIFEST_VERSION,
+    manifest: dict[str, Any] = {
+        "version": MANIFEST_VERSION,
         "root": str(root),
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-        "status": STATUS_PENDING,
-        "directories": sorted(directories),
-        "files": dict(sorted(files.items())),
+        "created_at": time.time(),
+        "files": {},
+        "directories": {},
     }
 
+    logger.info(
+        "Creating manifest for input: %s",
+        root,
+    )
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
+    file_count = 0
+    total_bytes = 0
+
+    for current_root, dirs, files in os.walk(root):
+
+        current_root_path = Path(
+            current_root
+        )
+
+        # Do not descend into system directories.
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in SKIP_DIRS
+        ]
+
+        # Record directories.
+        for dirname in dirs:
+
+            directory = (
+                current_root_path / dirname
+            )
+
+            if directory.is_symlink():
+                continue
+
+            rel = relative_path(
+                root,
+                directory,
+            )
+
+            manifest["directories"][rel] = {}
+
+        for filename in files:
+
+            path = (
+                current_root_path / filename
+            )
+
+            if path.is_symlink():
+                continue
+
+            if filename.endswith(
+                TEMP_SUFFIX
+            ):
+                continue
+
+            if not is_regular_file(path):
+                continue
+
+            rel = relative_path(
+                root,
+                path,
+            )
+
+            try:
+
+                st = path.stat()
+
+                logger.info(
+                    "Hashing [%d] %s",
+                    file_count + 1,
+                    rel,
+                )
+
+                digest = sha256_of(path)
+
+                manifest["files"][rel] = {
+                    "size": st.st_size,
+                    "mtime_ns": st.st_mtime_ns,
+                    "sha256": digest,
+                    "status": PENDING,
+                    "attempts": 0,
+                    "errors": [],
+                }
+
+                file_count += 1
+                total_bytes += st.st_size
+
+            except OSError as exc:
+
+                raise RuntimeError(
+                    f"Unable to inventory {path}: {exc}"
+                ) from exc
+
+    manifest["summary"] = {
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "directory_count": len(
+            manifest["directories"]
+        ),
+    }
+
+    logger.info(
+        "Manifest created: %d files, %.2f GB",
+        file_count,
+        total_bytes / (1024 ** 3),
+    )
+
+    return manifest
+
+
+# ============================================================
+# Source validation
+# ============================================================
 
 def validate_source_against_manifest(
     source: Path,
     expected: dict[str, Any],
-) -> tuple[bool, str]:
+) -> tuple[bool, str | None]:
     """
-    Authoritative source validation.
+    One full SHA-256 verification of the source.
 
-    Size + SHA-256 are required.
+    IMPORTANT ASSUMPTION:
+        The input tree is not modified after the process starts.
 
-    mtime_ns is recorded for diagnostics but is NOT used as an authority
-    because some filesystems may legitimately alter timestamps.
+    Therefore we do not hash the source a second time after copying.
     """
 
-    if source.is_symlink() or not source.is_file():
-        return False, FAIL_MISSING_SOURCE
+    if not is_regular_file(source):
+        return (
+            False,
+            "source is missing or is not a regular file",
+        )
 
     try:
-        if source.stat().st_size != expected["size"]:
-            return False, FAIL_MANIFEST_MISMATCH
 
-        if sha256_of(source) != expected["sha256"]:
-            return False, FAIL_MANIFEST_MISMATCH
+        st = source.stat()
 
-        return True, ""
+        expected_size = expected["size"]
 
-    except OSError:
-        return False, FAIL_ERROR
+        if st.st_size != expected_size:
 
+            return (
+                False,
+                f"size mismatch: "
+                f"expected={expected_size}, "
+                f"actual={st.st_size}",
+            )
+
+        actual_hash = sha256_of(source)
+
+        if actual_hash != expected["sha256"]:
+
+            return (
+                False,
+                f"SHA-256 mismatch: "
+                f"expected={expected['sha256']}, "
+                f"actual={actual_hash}",
+            )
+
+        return True, None
+
+    except OSError as exc:
+
+        return (
+            False,
+            f"unable to validate source: {exc}",
+        )
+
+
+# ============================================================
+# Temp validation
+# ============================================================
 
 def validate_temp(
     source: Path,
     temp: Path,
     expected: dict[str, Any],
-) -> tuple[bool, str]:
-    """
-    Validate the temporary target before os.replace().
-    """
+) -> tuple[bool, str | None]:
 
-    if not temp.exists() or temp.is_symlink() or not temp.is_file():
-        return False, FAIL_TEMP_VERIFY
+    if not is_regular_file(temp):
+        return (
+            False,
+            "temporary file is missing or invalid",
+        )
 
     try:
-        if temp.stat().st_size != expected["size"]:
-            return False, FAIL_TEMP_VERIFY
 
-        if sha256_of(temp) != expected["sha256"]:
-            return False, FAIL_TEMP_VERIFY
-
-        # Validate metadata relevant to this refresh operation.
         source_stat = source.stat()
         temp_stat = temp.stat()
 
-        if temp_stat.st_mode != source_stat.st_mode:
-            return False, FAIL_METADATA_VERIFY
+        expected_size = expected["size"]
+        expected_hash = expected["sha256"]
 
-        if temp_stat.st_mtime_ns != source_stat.st_mtime_ns:
-            return False, FAIL_METADATA_VERIFY
+        # Size first — avoid hashing if the size is already wrong.
+        if temp_stat.st_size != expected_size:
 
-        return True, ""
+            return (
+                False,
+                f"temporary size mismatch: "
+                f"expected={expected_size}, "
+                f"actual={temp_stat.st_size}",
+            )
 
-    except OSError:
-        return False, FAIL_TEMP_VERIFY
+        actual_hash = sha256_of(temp)
+
+        if actual_hash != expected_hash:
+
+            return (
+                False,
+                f"temporary SHA-256 mismatch: "
+                f"expected={expected_hash}, "
+                f"actual={actual_hash}",
+            )
+
+        source_mode = stat.S_IMODE(
+            source_stat.st_mode
+        )
+
+        temp_mode = stat.S_IMODE(
+            temp_stat.st_mode
+        )
+
+        if source_mode != temp_mode:
+
+            return (
+                False,
+                f"mode mismatch: "
+                f"source={oct(source_mode)}, "
+                f"temp={oct(temp_mode)}",
+            )
+
+        if (
+            temp_stat.st_mtime_ns
+            != source_stat.st_mtime_ns
+        ):
+
+            return (
+                False,
+                f"mtime mismatch: "
+                f"source={source_stat.st_mtime_ns}, "
+                f"temp={temp_stat.st_mtime_ns}",
+            )
+
+        return True, None
+
+    except OSError as exc:
+
+        return (
+            False,
+            f"temporary validation failed: {exc}",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Manifest task state
-# ---------------------------------------------------------------------------
+# ============================================================
+# Readonly handling
+# ============================================================
 
-def mark_file(
-    manifest: dict[str, Any],
-    relative: str,
-    status: str,
-    error: Optional[str] = None,
-    detail: Optional[str] = None,
-) -> None:
-    item = manifest["files"][relative]
+def ensure_writable(
+    path: Path,
+) -> int:
 
-    item["status"] = status
-    item["last_error"] = error
-    item["last_error_detail"] = detail
+    st = path.stat()
 
-
-def fail_task(
-    manifest: dict[str, Any],
-    relative: str,
-    reason: str,
-    detail: str,
-    manifest_path: Path,
-) -> bool:
-    mark_file(
-        manifest,
-        relative,
-        STATUS_FAILED,
-        reason,
-        detail,
+    original_mode = stat.S_IMODE(
+        st.st_mode
     )
 
-    save_manifest(manifest_path, manifest)
+    if not (
+        original_mode & stat.S_IWUSR
+    ):
 
-    return False
+        new_mode = (
+            original_mode
+            | stat.S_IWUSR
+        )
+
+        os.chmod(
+            path,
+            new_mode,
+        )
+
+    return original_mode
 
 
-# ---------------------------------------------------------------------------
+def restore_mode(
+    path: Path,
+    original_mode: int,
+) -> None:
+
+    try:
+
+        os.chmod(
+            path,
+            original_mode,
+        )
+
+    except OSError:
+
+        logger.warning(
+            "Could not restore permissions for %s",
+            path,
+        )
+
+
+# ============================================================
+# Temporary file cleanup
+# ============================================================
+
+def remove_temp(
+    temp: Path,
+) -> None:
+
+    try:
+
+        temp.unlink(
+            missing_ok=True
+        )
+
+    except OSError as exc:
+
+        logger.warning(
+            "Could not remove temporary file %s: %s",
+            temp,
+            exc,
+        )
+
+
+# ============================================================
+# Failure handling
+# ============================================================
+
+def record_failure(
+    item: dict[str, Any],
+    code: str,
+    message: str,
+) -> None:
+
+    item["status"] = FAILED
+
+    item.setdefault(
+        "errors",
+        [],
+    ).append(
+        {
+            "code": code,
+            "message": message,
+            "time": time.time(),
+        }
+    )
+
+
+# ============================================================
 # Recovery
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def recover_in_progress(
     root: Path,
     manifest: dict[str, Any],
-    manifest_path: Path,
 ) -> bool:
-    """
-    Conservative recovery after interruption.
 
-    We never automatically trust an old .refreshtmp.
+    changed = False
 
-    If the source still exactly matches the manifest:
-        delete old temp
-        return task to PENDING
+    for rel, item in manifest["files"].items():
 
-    If the source is missing or changed:
-        mark FAILED and stop processing.
-
-    This avoids automatically overwriting data that may have changed while
-    the program was not running.
-    """
-
-    safe = True
-
-    for relative, item in manifest["files"].items():
-
-        if item.get("status") != STATUS_IN_PROGRESS:
+        if item.get("status") != IN_PROGRESS:
             continue
 
-        source = root / Path(relative)
-        temp = temp_path_for(source)
-
-        # Old temp is not trusted after interruption.
-        remove_temp_file(temp)
-
-        if not source.exists():
-            mark_file(
-                manifest,
-                relative,
-                STATUS_FAILED,
-                FAIL_MISSING_SOURCE,
-                "Source disappeared while task was IN_PROGRESS",
-            )
-
-            safe = False
-            continue
-
-        matches, reason = validate_source_against_manifest(
-            source,
-            item,
+        source = (
+            root / Path(rel)
         )
 
-        if not matches:
-            mark_file(
-                manifest,
-                relative,
-                STATUS_FAILED,
-                reason or FAIL_MANIFEST_MISMATCH,
-                "Source no longer matches original manifest after recovery",
-            )
-
-            safe = False
-            continue
-
-        mark_file(
-            manifest,
-            relative,
-            STATUS_PENDING,
-            None,
-            "Recovered after interruption",
+        temp = source.with_name(
+            source.name + TEMP_SUFFIX
         )
 
-    save_manifest(manifest_path, manifest)
+        logger.warning(
+            "Recovering interrupted file: %s",
+            rel,
+        )
 
-    return safe
+        remove_temp(temp)
+
+        valid, error = (
+            validate_source_against_manifest(
+                source,
+                item,
+            )
+        )
+
+        if valid:
+
+            item["status"] = PENDING
+            changed = True
+
+        else:
+
+            record_failure(
+                item,
+                SOURCE_CHANGED,
+                error
+                or "source failed recovery validation",
+            )
+
+            changed = True
+
+    return changed
 
 
-# ---------------------------------------------------------------------------
-# Core refresh operation
-# ---------------------------------------------------------------------------
-
+# ============================================================
+# Refresh one file
+# ============================================================
 
 def refresh_file(
     root: Path,
-    relative: str,
-    expected: dict[str, Any],
-    manifest: dict[str, Any],
-    manifest_path: Path,
+    rel: str,
+    item: dict[str, Any],
 ) -> bool:
+    """
+    Refresh one file.
 
-    source = root / Path(relative)
-    temp = temp_path_for(source)
+    ASSUMPTION:
+        No file under root is modified externally after
+        this process starts.
 
-    # ---------------------------------------------------------------
-    # Safety check 1: source must exist and be a normal file.
-    # ---------------------------------------------------------------
+    Workflow:
 
-    if source.is_symlink() or not source.is_file():
-        return fail_task(
-            manifest,
-            relative,
-            FAIL_MISSING_SOURCE,
-            "Source is missing, is a symlink, or is not a regular file",
-            manifest_path,
-        )
+        source SHA-256
+             ↓
+        copy2 → temp
+             ↓
+        fsync temp
+             ↓
+        temp SHA-256
+             ↓
+        metadata verification
+             ↓
+        atomic replace
+    """
 
-    # ---------------------------------------------------------------
-    # Safety check 2: never overwrite an unexpected pre-existing temp.
-    # ---------------------------------------------------------------
+    source = root / Path(rel)
 
-    if temp.exists() or temp.is_symlink():
-        return fail_task(
-            manifest,
-            relative,
-            FAIL_ERROR,
-            f"Pre-existing temporary file found: {temp}",
-            manifest_path,
-        )
-
-    # ---------------------------------------------------------------
-    # Safety check 3: source must match manifest BEFORE doing anything.
-    # ---------------------------------------------------------------
-
-    source_ok, reason = validate_source_against_manifest(
-        source,
-        expected,
+    temp = source.with_name(
+        source.name + TEMP_SUFFIX
     )
 
-    if not source_ok:
-        return fail_task(
-            manifest,
-            relative,
-            reason or FAIL_MANIFEST_MISMATCH,
-            "Source does not match the original manifest; refusing replacement",
-            manifest_path,
-        )
-
-    # ---------------------------------------------------------------
-    # Safety check 4: enough disk space.
-    # ---------------------------------------------------------------
-
-    required_bytes = expected["size"]
-    safety_bytes = SAFETY_MARGIN_GB * (1024 ** 3)
-
-    if get_free_gb(source) * (1024 ** 3) < required_bytes + safety_bytes:
-        return fail_task(
-            manifest,
-            relative,
-            FAIL_NO_SPACE,
-            "Insufficient free space for temporary copy and safety margin",
-            manifest_path,
-        )
-
-    original_readonly = is_readonly(source)
-
-    item = manifest["files"][relative]
-    item["attempts"] = int(item.get("attempts", 0)) + 1
-
-    mark_file(
-        manifest,
-        relative,
-        STATUS_IN_PROGRESS,
-        None,
-        None,
+    logger.info(
+        "Refreshing: %s",
+        rel,
     )
 
-    save_manifest(manifest_path, manifest)
+    # --------------------------------------------------------
+    # Source must exist and be a regular file.
+    # --------------------------------------------------------
+
+    if not is_regular_file(source):
+
+        record_failure(
+            item,
+            MISSING_SOURCE,
+            "source is missing or is not a regular file",
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Remove stale temp.
+    # --------------------------------------------------------
+
+    if temp.exists():
+
+        logger.warning(
+            "Removing stale temp file: %s",
+            temp,
+        )
+
+        remove_temp(temp)
+
+    # --------------------------------------------------------
+    # Verify source ONCE.
+    # --------------------------------------------------------
+
+    valid, error = (
+        validate_source_against_manifest(
+            source,
+            item,
+        )
+    )
+
+    if not valid:
+
+        record_failure(
+            item,
+            SOURCE_CHANGED,
+            error or "source validation failed",
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Space check.
+    # --------------------------------------------------------
 
     try:
-        for attempt in range(1, MAX_RETRIES + 1):
+
+        required = item["size"]
+
+        free = shutil.disk_usage(
+            source.parent
+        ).free
+
+        safety_margin = (
+            SAFETY_MARGIN_GB
+            * 1024 ** 3
+        )
+
+        if free < (
+            required
+            + safety_margin
+        ):
+
+            record_failure(
+                item,
+                NO_SPACE,
+                f"insufficient free space: "
+                f"required={required}, "
+                f"free={free}, "
+                f"margin={safety_margin}",
+            )
+
+            return False
+
+    except OSError as exc:
+
+        record_failure(
+            item,
+            ERROR,
+            f"unable to check disk space: {exc}",
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Mark IN_PROGRESS in memory.
+    #
+    # It is checkpointed periodically by process().
+    # --------------------------------------------------------
+
+    item["status"] = IN_PROGRESS
+
+    original_mode: int | None = None
+
+    try:
+
+        for attempt in range(
+            item.get("attempts", 0) + 1,
+            MAX_RETRIES + 1,
+        ):
+
+            item["attempts"] = attempt
+
+            logger.info(
+                "Attempt %d/%d: %s",
+                attempt,
+                MAX_RETRIES,
+                rel,
+            )
+
+            remove_temp(temp)
 
             try:
-                # ---------------------------------------------------
-                # Safety check 5:
-                # source must still match immediately before copying.
-                # ---------------------------------------------------
 
-                source_ok, reason = validate_source_against_manifest(
-                    source,
-                    expected,
+                # --------------------------------------------
+                # Make source writable if required.
+                # --------------------------------------------
+
+                original_mode = ensure_writable(
+                    source
                 )
 
-                if not source_ok:
-                    return fail_task(
-                        manifest,
-                        relative,
-                        reason or FAIL_SOURCE_CHANGED,
-                        "Source changed before temporary copy",
-                        manifest_path,
-                    )
+                # --------------------------------------------
+                # Copy.
+                # --------------------------------------------
 
-                # ---------------------------------------------------
-                # Create temporary copy.
-                # ---------------------------------------------------
-
-                copy_writethrough(source, temp)
-
-                # ---------------------------------------------------
-                # Safety check 6:
-                # SOURCE MUST STILL MATCH immediately after copying.
-                #
-                # This check intentionally happens BEFORE validate_temp.
-                # If the source changed while it was being copied, the
-                # result must be SOURCE_CHANGED, not METADATA_VERIFY.
-                # ---------------------------------------------------
-
-                source_ok, _reason = validate_source_against_manifest(
-                    source,
-                    expected,
+                logger.info(
+                    "Copying to temporary file: %s",
+                    rel,
                 )
 
-                if not source_ok:
-                    remove_temp_file(temp)
-
-                    return fail_task(
-                        manifest,
-                        relative,
-                        FAIL_SOURCE_CHANGED,
-                        "Source changed during refresh; original retained",
-                        manifest_path,
-                    )
-
-                # ---------------------------------------------------
-                # Safety check 7 + 8:
-                # Now validate the temporary copy itself.
-                #
-                # The source has already been independently confirmed
-                # unchanged, so failures here belong to the temp copy.
-                # ---------------------------------------------------
-
-                temp_ok, temp_reason = validate_temp(
+                copy_writethrough(
                     source,
                     temp,
-                    expected,
                 )
 
-                if not temp_ok:
-                    remove_temp_file(temp)
+                # --------------------------------------------
+                # Verify temp.
+                # --------------------------------------------
 
-                    return fail_task(
-                        manifest,
-                        relative,
-                        temp_reason or FAIL_TEMP_VERIFY,
-                        "Temporary file failed validation; original retained",
-                        manifest_path,
+                logger.info(
+                    "Verifying temporary file: %s",
+                    rel,
+                )
+
+                valid, error = validate_temp(
+                    source,
+                    temp,
+                    item,
+                )
+
+                if not valid:
+
+                    logger.error(
+                        "Temp verification failed for %s: %s",
+                        rel,
+                        error,
                     )
 
-                # ---------------------------------------------------
-                # At this exact point ALL pre-replacement validations
-                # have passed:
-                #
-                #   1. source existed and was regular
-                #   2. source matched manifest before copy
-                #   3. source matched manifest after copy
-                #   4. temp passed size/hash/metadata validation
-                #
-                # Only now may os.replace() be called.
-                # ---------------------------------------------------
+                    if attempt < MAX_RETRIES:
 
-                if original_readonly:
-                    set_readonly(source, False)
-
-                try:
-                    os.replace(temp, source)
-                except OSError as exc:
-                    # Original is retained if replacement fails.
-                    # Temp is our artifact and can safely be removed.
-                    remove_temp_file(temp)
-
-                    if attempt >= MAX_RETRIES:
-                        return fail_task(
-                            manifest,
-                            relative,
-                            FAIL_REPLACE,
-                            str(exc),
-                            manifest_path,
+                        time.sleep(
+                            RETRY_DELAY
                         )
 
-                    time.sleep(RETRY_DELAY)
-                    continue
+                        continue
 
-                # ---------------------------------------------------
-                # os.replace() succeeded.
-                # ---------------------------------------------------
+                    record_failure(
+                        item,
+                        TEMP_VERIFY,
+                        error
+                        or "temporary file verification failed",
+                    )
 
-                mark_file(
-                    manifest,
-                    relative,
-                    STATUS_COMPLETED,
-                    None,
-                    None,
+                    return False
+
+                # --------------------------------------------
+                # Atomic replacement.
+                # --------------------------------------------
+
+                logger.info(
+                    "Replacing original: %s",
+                    rel,
                 )
 
-                save_manifest(manifest_path, manifest)
+                try:
+
+                    os.replace(
+                        temp,
+                        source,
+                    )
+
+                except PermissionError as exc:
+
+                    if attempt < MAX_RETRIES:
+
+                        logger.warning(
+                            "Replace permission error for %s: %s",
+                            rel,
+                            exc,
+                        )
+
+                        time.sleep(
+                            RETRY_DELAY
+                        )
+
+                        continue
+
+                    record_failure(
+                        item,
+                        REPLACE,
+                        f"replace failed: {exc}",
+                    )
+
+                    return False
+
+                except OSError as exc:
+
+                    if attempt < MAX_RETRIES:
+
+                        logger.warning(
+                            "Replace failed for %s: %s",
+                            rel,
+                            exc,
+                        )
+
+                        time.sleep(
+                            RETRY_DELAY
+                        )
+
+                        continue
+
+                    record_failure(
+                        item,
+                        REPLACE,
+                        f"replace failed: {exc}",
+                    )
+
+                    return False
+
+                # --------------------------------------------
+                # Success.
+                # --------------------------------------------
+
+                item["status"] = COMPLETED
+                item["errors"] = []
+
+                logger.info(
+                    "Completed: %s",
+                    rel,
+                )
 
                 return True
 
             except PermissionError as exc:
-                remove_temp_file(temp)
 
-                if attempt >= MAX_RETRIES:
-                    return fail_task(
-                        manifest,
-                        relative,
-                        FAIL_PERMISSION,
-                        str(exc),
-                        manifest_path,
+                if attempt < MAX_RETRIES:
+
+                    logger.warning(
+                        "Permission error for %s: %s",
+                        rel,
+                        exc,
                     )
 
-                time.sleep(RETRY_DELAY)
+                    time.sleep(
+                        RETRY_DELAY
+                    )
+
+                    continue
+
+                record_failure(
+                    item,
+                    PERMISSION,
+                    str(exc),
+                )
+
+                return False
 
             except OSError as exc:
-                remove_temp_file(temp)
 
-                if attempt >= MAX_RETRIES:
-                    return fail_task(
-                        manifest,
-                        relative,
-                        FAIL_ERROR,
-                        str(exc),
-                        manifest_path,
+                if attempt < MAX_RETRIES:
+
+                    logger.warning(
+                        "I/O error for %s: %s",
+                        rel,
+                        exc,
                     )
 
-                time.sleep(RETRY_DELAY)
+                    time.sleep(
+                        RETRY_DELAY
+                    )
+
+                    continue
+
+                record_failure(
+                    item,
+                    ERROR,
+                    str(exc),
+                )
+
+                return False
 
             except Exception as exc:
-                remove_temp_file(temp)
 
-                return fail_task(
-                    manifest,
-                    relative,
-                    FAIL_ERROR,
-                    repr(exc),
-                    manifest_path,
+                record_failure(
+                    item,
+                    ERROR,
+                    f"{type(exc).__name__}: {exc}",
                 )
 
-        return False
+                return False
 
     finally:
-        # NEVER delete source here.
-        #
-        # Only our temporary artifact may be cleaned up.
-        remove_temp_file(temp)
 
-        # Restore readonly state if we changed it.
-        if source.exists() and original_readonly:
-            try:
-                set_readonly(source, True)
-            except OSError as exc:
-                logger.error(
-                    "Could not restore readonly state for %s: %s",
-                    source,
-                    exc,
-                )
+        remove_temp(temp)
+
+        if (
+            original_mode is not None
+            and source.exists()
+        ):
+
+            restore_mode(
+                source,
+                original_mode,
+            )
+
+    return False
 
 
-# ---------------------------------------------------------------------------
-# Whole-archive validation
-# ---------------------------------------------------------------------------
+# ============================================================
+# Final archive validation
+# ============================================================
 
 def validate_archive(
     root: Path,
     manifest: dict[str, Any],
 ) -> ValidationResult:
-    """
-    Independently validate the complete archive against the manifest.
-
-    File counts are reported for diagnostics only.
-
-    A successful validation requires:
-        - every expected file exists
-        - no unexpected files exist
-        - every expected file has the expected size
-        - every expected file has the expected SHA-256
-        - every expected directory exists
-        - no unexpected directories exist
-        - no temporary refresh files remain
-    """
 
     result = ValidationResult()
 
-    # ---------------------------------------------------------------
-    # Expected inventory
-    # ---------------------------------------------------------------
+    expected_files = set(
+        manifest["files"].keys()
+    )
 
-    expected_files = set(manifest["files"])
-    expected_dirs = set(manifest.get("directories", []))
+    expected_dirs = set(
+        manifest["directories"].keys()
+    )
 
-    result.expected_files = len(expected_files)
-    result.expected_directories = len(expected_dirs)
+    result.expected_files = len(
+        expected_files
+    )
 
-    # ---------------------------------------------------------------
-    # Actual directories and files
-    # ---------------------------------------------------------------
+    result.expected_directories = len(
+        expected_dirs
+    )
 
-    actual_dirs: set[str] = set()
     actual_files: set[str] = set()
-    temporary_files: set[str] = set()
+    actual_dirs: set[str] = set()
 
-    for current, dirnames, filenames in os.walk(
-        root,
-        topdown=True,
-        followlinks=False,
-    ):
-        current_path = Path(current)
+    # --------------------------------------------------------
+    # Inventory actual archive.
+    # --------------------------------------------------------
 
-        # Do not traverse excluded/system directories or symlinks.
-        dirnames[:] = [
+    for current_root, dirs, files in os.walk(root):
+
+        current_root_path = Path(
+            current_root
+        )
+
+        dirs[:] = [
             d
-            for d in dirnames
+            for d in dirs
             if d not in SKIP_DIRS
-            and not (current_path / d).is_symlink()
         ]
 
-        if current_path != root:
-            actual_dirs.add(
-                relative_key(root, current_path)
+        for dirname in dirs:
+
+            directory = (
+                current_root_path / dirname
             )
 
-        for name in filenames:
-            path = current_path / name
-
-            relative = relative_key(root, path)
-
-            # Temporary files are never considered archive files.
-            if name.endswith(TEMP_SUFFIX):
-                temporary_files.add(relative)
+            if directory.is_symlink():
                 continue
 
-            # Symlinks and non-regular files are not archive files.
-            if path.is_symlink() or not path.is_file():
+            rel = relative_path(
+                root,
+                directory,
+            )
+
+            actual_dirs.add(rel)
+
+        for filename in files:
+
+            path = (
+                current_root_path / filename
+            )
+
+            if path.is_symlink():
                 continue
 
-            actual_files.add(relative)
+            rel = relative_path(
+                root,
+                path,
+            )
 
-    result.present_files = len(actual_files)
-    result.present_directories = len(actual_dirs)
-    result.temporary_files = len(temporary_files)
+            if filename.endswith(
+                TEMP_SUFFIX
+            ):
 
-    # ---------------------------------------------------------------
-    # Directory validation
-    # ---------------------------------------------------------------
-
-    missing_dirs = sorted(expected_dirs - actual_dirs)
-    unexpected_dirs = sorted(actual_dirs - expected_dirs)
-
-    result.missing_directories = len(missing_dirs)
-    result.unexpected_directories = len(unexpected_dirs)
-
-    for directory in missing_dirs:
-        result.errors.append(
-            f"Missing directory: {directory}"
-        )
-
-    for directory in unexpected_dirs:
-        result.errors.append(
-            f"Unexpected directory: {directory}"
-        )
-
-    # ---------------------------------------------------------------
-    # File inventory validation
-    #
-    # This is path-based, not count-based.
-    #
-    # Therefore:
-    #
-    #   deleted A + added B
-    #
-    # is detected even when the file count is unchanged.
-    # ---------------------------------------------------------------
-
-    missing_files = sorted(expected_files - actual_files)
-    unexpected_files = sorted(actual_files - expected_files)
-
-    result.missing_files = len(missing_files)
-    result.unexpected_files = len(unexpected_files)
-
-    for relative in missing_files:
-        result.errors.append(
-            f"Missing file: {relative}"
-        )
-
-    for relative in unexpected_files:
-        result.errors.append(
-            f"Unexpected file: {relative}"
-        )
-
-    # ---------------------------------------------------------------
-    # Content validation
-    # ---------------------------------------------------------------
-
-    for relative in sorted(expected_files & actual_files):
-        expected = manifest["files"][relative]
-        path = root / Path(relative)
-
-        try:
-            actual_size = path.stat().st_size
-
-            if actual_size != expected["size"]:
-                result.size_mismatches += 1
+                result.temporary_files += 1
 
                 result.errors.append(
-                    f"Size mismatch: {relative} "
-                    f"(expected {expected['size']}, "
-                    f"actual {actual_size})"
+                    f"temporary file remains: {rel}"
                 )
 
-                # Size mismatch already proves the file is invalid.
-                # No need to calculate a potentially expensive hash.
                 continue
 
-            actual_hash = sha256_of(path)
+            if not is_regular_file(path):
+                continue
 
-            if actual_hash != expected["sha256"]:
-                result.hash_mismatches += 1
+            actual_files.add(rel)
+
+    result.present_files = len(
+        actual_files
+    )
+
+    result.present_directories = len(
+        actual_dirs
+    )
+
+    # --------------------------------------------------------
+    # Exact file path comparison.
+    # --------------------------------------------------------
+
+    missing_files = (
+        expected_files - actual_files
+    )
+
+    unexpected_files = (
+        actual_files - expected_files
+    )
+
+    result.missing_files = len(
+        missing_files
+    )
+
+    result.unexpected_files = len(
+        unexpected_files
+    )
+
+    for rel in sorted(
+        missing_files
+    ):
+
+        result.errors.append(
+            f"missing file: {rel}"
+        )
+
+    for rel in sorted(
+        unexpected_files
+    ):
+
+        result.errors.append(
+            f"unexpected file: {rel}"
+        )
+
+    # --------------------------------------------------------
+    # Exact directory path comparison.
+    # --------------------------------------------------------
+
+    missing_dirs = (
+        expected_dirs - actual_dirs
+    )
+
+    unexpected_dirs = (
+        actual_dirs - expected_dirs
+    )
+
+    result.missing_directories = len(
+        missing_dirs
+    )
+
+    result.unexpected_directories = len(
+        unexpected_dirs
+    )
+
+    for rel in sorted(
+        missing_dirs
+    ):
+
+        result.errors.append(
+            f"missing directory: {rel}"
+        )
+
+    for rel in sorted(
+        unexpected_dirs
+    ):
+
+        result.errors.append(
+            f"unexpected directory: {rel}"
+        )
+
+    # --------------------------------------------------------
+    # Verify content of expected files.
+    # --------------------------------------------------------
+
+    for rel in sorted(
+        expected_files & actual_files
+    ):
+
+        path = root / Path(rel)
+
+        expected = manifest[
+            "files"
+        ][rel]
+
+        try:
+
+            st = path.stat()
+
+            if st.st_size != expected["size"]:
+
+                result.size_mismatches += 1
+                result.validation_errors += 1
 
                 result.errors.append(
-                    f"Hash mismatch: {relative} "
+                    f"size mismatch: {rel} "
+                    f"(expected {expected['size']}, "
+                    f"actual {st.st_size})"
+                )
+
+                continue
+
+            actual_hash = sha256_of(
+                path
+            )
+
+            if actual_hash != expected["sha256"]:
+
+                result.hash_mismatches += 1
+                result.validation_errors += 1
+
+                result.errors.append(
+                    f"hash mismatch: {rel} "
                     f"(expected {expected['sha256']}, "
                     f"actual {actual_hash})"
                 )
@@ -979,38 +1337,33 @@ def validate_archive(
             result.verified_files += 1
 
         except OSError as exc:
+
             result.validation_errors += 1
 
             result.errors.append(
-                f"Could not validate {relative}: {exc}"
+                f"validation error: {rel}: {exc}"
             )
 
-    # ---------------------------------------------------------------
-    # Temporary-file validation
-    # ---------------------------------------------------------------
-
-    for relative in sorted(temporary_files):
-        result.errors.append(
-            f"Leftover temporary file: {relative}"
-        )
-
     return result
+
+
+# ============================================================
+# Refresh summary
+# ============================================================
 
 def get_refresh_summary(
     manifest: dict[str, Any],
 ) -> dict[str, int]:
-    """
-    Return counts for refresh task states.
-    """
 
     summary = {
-        STATUS_PENDING: 0,
-        STATUS_IN_PROGRESS: 0,
-        STATUS_COMPLETED: 0,
-        STATUS_FAILED: 0,
+        PENDING: 0,
+        IN_PROGRESS: 0,
+        COMPLETED: 0,
+        FAILED: 0,
     }
 
     for item in manifest["files"].values():
+
         status = item.get("status")
 
         if status in summary:
@@ -1018,350 +1371,659 @@ def get_refresh_summary(
 
     return summary
 
+
+# ============================================================
+# Final summary
+# ============================================================
+
 def log_final_summary(
     root: Path,
+    manifest_path: Path,
     manifest: dict[str, Any],
     validation: ValidationResult,
+    refresh_summary: dict[str, int],
+    overall_ok: bool,
 ) -> None:
-    """
-    Log a human-readable final refresh/validation summary.
-    """
 
-    refresh = get_refresh_summary(manifest)
+    print()
+    print("=" * 72)
+    print("FINAL REFRESH SUMMARY")
+    print("=" * 72)
 
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info("REFRESH SUMMARY")
-    logger.info("=" * 70)
-
-    logger.info("Root: %s", root)
-
-    logger.info("")
-    logger.info("Manifest inventory:")
-    logger.info(
-        "  Expected files:        %d",
-        validation.expected_files,
-    )
-    logger.info(
-        "  Expected directories:  %d",
-        validation.expected_directories,
+    print(
+        f"Input root:        {root}"
     )
 
-    logger.info("")
-    logger.info("Final archive inventory:")
-    logger.info(
-        "  Files present:         %d",
-        validation.present_files,
-    )
-    logger.info(
-        "  Directories present:   %d",
-        validation.present_directories,
+    print(
+        f"Manifest:          {manifest_path}"
     )
 
-    logger.info("")
-    logger.info("Refresh tasks:")
-    logger.info(
-        "  Completed:             %d",
-        refresh[STATUS_COMPLETED],
-    )
-    logger.info(
-        "  Failed:                %d",
-        refresh[STATUS_FAILED],
-    )
-    logger.info(
-        "  Pending:               %d",
-        refresh[STATUS_PENDING],
-    )
-    logger.info(
-        "  In progress:           %d",
-        refresh[STATUS_IN_PROGRESS],
+    print()
+
+    print("Manifest:")
+    print(
+        f"  Expected files:       "
+        f"{validation.expected_files}"
     )
 
-    logger.info("")
-    logger.info("Final validation:")
-    logger.info(
-        "  Files verified:        %d",
-        validation.verified_files,
-    )
-    logger.info(
-        "  Missing files:         %d",
-        validation.missing_files,
-    )
-    logger.info(
-        "  Unexpected files:      %d",
-        validation.unexpected_files,
-    )
-    logger.info(
-        "  Size mismatches:       %d",
-        validation.size_mismatches,
-    )
-    logger.info(
-        "  Hash mismatches:       %d",
-        validation.hash_mismatches,
-    )
-    logger.info(
-        "  Validation errors:     %d",
-        validation.validation_errors,
-    )
-    logger.info(
-        "  Missing directories:   %d",
-        validation.missing_directories,
-    )
-    logger.info(
-        "  Unexpected directories:%d",
-        validation.unexpected_directories,
-    )
-    logger.info(
-        "  Temporary files:       %d",
-        validation.temporary_files,
+    print(
+        f"  Expected directories: "
+        f"{validation.expected_directories}"
     )
 
-    logger.info("")
+    print()
 
-    if validation.valid:
-        logger.info("RESULT: VALIDATION PASSED")
-    else:
-        logger.error("RESULT: VALIDATION FAILED")
+    print("Archive:")
+    print(
+        f"  Present files:        "
+        f"{validation.present_files}"
+    )
+
+    print(
+        f"  Verified files:       "
+        f"{validation.verified_files}"
+    )
+
+    print(
+        f"  Present directories:  "
+        f"{validation.present_directories}"
+    )
+
+    print()
+
+    print("File differences:")
+    print(
+        f"  Missing files:        "
+        f"{validation.missing_files}"
+    )
+
+    print(
+        f"  Unexpected files:     "
+        f"{validation.unexpected_files}"
+    )
+
+    print(
+        f"  Size mismatches:      "
+        f"{validation.size_mismatches}"
+    )
+
+    print(
+        f"  Hash mismatches:      "
+        f"{validation.hash_mismatches}"
+    )
+
+    print(
+        f"  Validation errors:    "
+        f"{validation.validation_errors}"
+    )
+
+    print(
+        f"  Temporary files:      "
+        f"{validation.temporary_files}"
+    )
+
+    print()
+
+    print("Directory differences:")
+    print(
+        f"  Missing directories:  "
+        f"{validation.missing_directories}"
+    )
+
+    print(
+        f"  Unexpected dirs:      "
+        f"{validation.unexpected_directories}"
+    )
+
+    print()
+
+    print("Task states:")
+
+    for status in (
+        PENDING,
+        IN_PROGRESS,
+        COMPLETED,
+        FAILED,
+    ):
+
+        print(
+            f"  {status:12}: "
+            f"{refresh_summary[status]}"
+        )
+
+    print()
+
+    print(
+        "Archive validation: "
+        f"{'PASS' if validation.valid else 'FAIL'}"
+    )
+
+    print(
+        "Overall result:     "
+        f"{'PASS' if overall_ok else 'FAIL'}"
+    )
+
+    if validation.errors:
+
+        print()
+        print("Validation errors:")
 
         for error in validation.errors:
-            logger.error("  %s", error)
+            print(
+                f"  - {error}"
+            )
 
-    logger.info("=" * 70)
-    logger.info("")
+    print("=" * 72)
 
-# ---------------------------------------------------------------------------
-# Main processing
-# ---------------------------------------------------------------------------
+
+# ============================================================
+# Process ONE input root
+# ============================================================
 
 def process(
     root: Path,
     manifest_path: Path,
-    supplied_manifest: bool,
-) -> int:
+    create_new_manifest: bool = False,
+) -> bool:
 
     root = root.resolve()
+    manifest_path = manifest_path.resolve()
 
-    # ---------------------------------------------------------------
-    # Manifest selection
-    # ---------------------------------------------------------------
+    # --------------------------------------------------------
+    # Input validation.
+    # --------------------------------------------------------
 
-    if supplied_manifest and manifest_path.exists():
-        logger.info("manifest file supplied and exists")
-        manifest = load_manifest(manifest_path)
-        validate_manifest_root(root, manifest)
+    if not root.exists():
 
-    elif supplied_manifest and not manifest_path.exists():
-        logger.info("manifest file supplied but it doesnt exists")
-        manifest = create_manifest(root)
-        save_manifest(manifest_path, manifest)
+        logger.error(
+            "Input path does not exist: %s",
+            root,
+        )
+
+        return False
+
+    if not root.is_dir():
+
+        logger.error(
+            "Input path is not a directory: %s",
+            root,
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Important safety check:
+    #
+    # We strongly recommend manifest NOT be inside root.
+    # --------------------------------------------------------
+
+    try:
+
+        manifest_path.relative_to(root)
+
+        manifest_inside_root = True
+
+    except ValueError:
+
+        manifest_inside_root = False
+
+    if manifest_inside_root:
+
+        logger.error(
+            "Manifest must not be inside the input root."
+        )
+
+        logger.error(
+            "Input root: %s",
+            root,
+        )
+
+        logger.error(
+            "Manifest: %s",
+            manifest_path,
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Start.
+    # --------------------------------------------------------
+
+    logger.info("=" * 72)
+
+    logger.info(
+        "Starting refresh"
+    )
+
+    logger.info(
+        "Input root: %s",
+        root,
+    )
+
+    logger.info(
+        "Manifest: %s",
+        manifest_path,
+    )
+
+    logger.info(
+        "IMPORTANT: input files must not be modified "
+        "during this process."
+    )
+
+    logger.info("=" * 72)
+
+    # --------------------------------------------------------
+    # Load or create manifest.
+    # --------------------------------------------------------
+
+    if (
+        manifest_path.exists()
+        and not create_new_manifest
+    ):
+
+        logger.info(
+            "Loading existing manifest: %s",
+            manifest_path,
+        )
+
+        manifest = load_manifest(
+            manifest_path
+        )
+
+        manifest_root = Path(
+            manifest["root"]
+        ).resolve()
+
+        if manifest_root != root:
+
+            raise RuntimeError(
+                "Manifest root mismatch: "
+                f"manifest={manifest_root}, "
+                f"requested={root}"
+            )
 
     else:
 
-        # No manifest argument = always a fresh run.
-        logger.info("manifest file not supplied")
-        manifest = create_manifest(root)
-        save_manifest(manifest_path, manifest)
+        logger.info(
+            "Creating new manifest: %s",
+            manifest_path,
+        )
 
-    # ---------------------------------------------------------------
-    # Recover interrupted tasks.
-    # ---------------------------------------------------------------
+        manifest = create_manifest(
+            root
+        )
 
-    if not recover_in_progress(
+        save_manifest(
+            manifest_path,
+            manifest,
+        )
+
+        logger.info(
+            "Manifest saved: %s",
+            manifest_path,
+        )
+
+    # --------------------------------------------------------
+    # Recover interrupted work.
+    # --------------------------------------------------------
+
+    if recover_in_progress(
         root,
         manifest,
-        manifest_path,
     ):
-        manifest["status"] = STATUS_FAILED
-        save_manifest(manifest_path, manifest)
-        return 2
+
+        logger.info(
+            "Saving recovery state..."
+        )
+
+        save_manifest(
+            manifest_path,
+            manifest,
+        )
+
+    # --------------------------------------------------------
+    # Process files.
+    # --------------------------------------------------------
+
+    files = manifest["files"]
+
+    total = len(files)
+
+    checkpoint_counter = 0
 
     overall_ok = True
 
-    # ---------------------------------------------------------------
-    # Process every file.
-    # ---------------------------------------------------------------
-
-    for relative, expected in list(
-        manifest["files"].items()
+    for index, (rel, item) in enumerate(
+        files.items(),
+        start=1,
     ):
-        logger.info(f"started processing {root / Path(relative)}")
-        status = expected.get("status")
 
-        if status == STATUS_COMPLETED:
+        status = item.get(
+            "status"
+        )
 
-            # Completed means completed according to the manifest.
-            # We still independently verify it on restart.
-            ok, reason = validate_source_against_manifest(
-                root / Path(relative),
-                expected,
-            )
+        if status == COMPLETED:
+            continue
 
-            if ok:
-                continue
-
-            fail_task(
-                manifest,
-                relative,
-                FAIL_MANIFEST_MISMATCH,
-                "Previously completed file no longer matches manifest",
-                manifest_path,
-            )
+        if status == FAILED:
 
             overall_ok = False
-            break
+            continue
 
-        if not refresh_file(
+        logger.info(
+            "[%d/%d] %s",
+            index,
+            total,
+            rel,
+        )
+
+        success = refresh_file(
             root,
-            relative,
-            expected,
-            manifest,
-            manifest_path,
-        ):
+            rel,
+            item,
+        )
+
+        checkpoint_counter += 1
+
+        if not success:
+
             overall_ok = False
 
-            # These failures indicate an unsafe/ambiguous archive state.
-            # Stop instead of proceeding blindly.
-            if expected.get("last_error") in {
-                FAIL_SOURCE_CHANGED,
-                FAIL_MISSING_SOURCE,
-                FAIL_MANIFEST_MISMATCH,
-                FAIL_TEMP_VERIFY,
-                FAIL_METADATA_VERIFY,
-            }:
-                break
+            # Failure is persisted immediately.
+            save_manifest(
+                manifest_path,
+                manifest,
+            )
 
-    # ---------------------------------------------------------------
-    # Independent final validation.
-    #
-    # IMPORTANT:
-    #
-    # File counts are only reported as statistics.
-    # They are NOT used as the validation criterion.
-    #
-    # The validator compares exact relative paths and then verifies
-    # size + SHA-256 for every expected file.
-    # ---------------------------------------------------------------
+            checkpoint_counter = 0
 
-    validation = validate_archive(
-        root,
-        manifest,
-    )
+        elif (
+            checkpoint_counter
+            >= MANIFEST_CHECKPOINT_FILES
+        ):
 
-    if not validation.valid:
-        overall_ok = False
+            logger.info(
+                "Saving manifest checkpoint..."
+            )
 
-    # ---------------------------------------------------------------
-    # Validate refresh task states as well.
-    # ---------------------------------------------------------------
+            save_manifest(
+                manifest_path,
+                manifest,
+            )
 
-    refresh_summary = get_refresh_summary(manifest)
+            checkpoint_counter = 0
 
-    if refresh_summary[STATUS_PENDING] > 0:
-        overall_ok = False
-
-    if refresh_summary[STATUS_IN_PROGRESS] > 0:
-        overall_ok = False
-
-    if refresh_summary[STATUS_FAILED] > 0:
-        overall_ok = False
-
-    # ---------------------------------------------------------------
-    # Store final validation information in the manifest.
-    # ---------------------------------------------------------------
-
-    manifest["validation"] = validation.to_dict()
-
-    manifest["refresh_summary"] = refresh_summary
-
-    manifest["status"] = (
-        STATUS_COMPLETED
-        if overall_ok
-        else STATUS_FAILED
-    )
-
-    # Log the complete final summary before saving.
-    log_final_summary(
-        root,
-        manifest,
-        validation,
-    )
+    # --------------------------------------------------------
+    # Always save before final validation.
+    # --------------------------------------------------------
 
     save_manifest(
         manifest_path,
         manifest,
     )
 
-    return 0 if overall_ok else 2
+    # --------------------------------------------------------
+    # Final independent validation.
+    # --------------------------------------------------------
 
+    logger.info(
+        "Starting final independent archive validation..."
+    )
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+    validation = validate_archive(
+        root,
+        manifest,
+    )
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Safely refresh archive files using verified "
-            "temporary copies."
+    # --------------------------------------------------------
+    # Task-state validation.
+    # --------------------------------------------------------
+
+    refresh_summary = (
+        get_refresh_summary(
+            manifest
         )
     )
 
-    parser.add_argument(
-        "-p",
-        "--path",
-        # dest="root",
-        type=Path,
-        required=True,
-        help="Folder to refresh",
+    if refresh_summary[PENDING] > 0:
+        overall_ok = False
+
+    if refresh_summary[IN_PROGRESS] > 0:
+        overall_ok = False
+
+    if refresh_summary[FAILED] > 0:
+        overall_ok = False
+
+    if not validation.valid:
+        overall_ok = False
+
+    # --------------------------------------------------------
+    # Save final result.
+    # --------------------------------------------------------
+
+    manifest["validation"] = (
+        validation.to_dict()
     )
 
+    manifest["refresh_summary"] = (
+        refresh_summary
+    )
+
+    manifest["overall_status"] = (
+        "COMPLETED"
+        if overall_ok
+        else "FAILED"
+    )
+
+    manifest["completed_at"] = time.time()
+
+    save_manifest(
+        manifest_path,
+        manifest,
+    )
+
+    # --------------------------------------------------------
+    # Report.
+    # --------------------------------------------------------
+
+    log_final_summary(
+        root=root,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        validation=validation,
+        refresh_summary=refresh_summary,
+        overall_ok=overall_ok,
+    )
+
+    return overall_ok
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Safely refresh files under one input directory "
+            "using SHA-256 verification, temporary copies "
+            "and atomic replacement."
+        )
+    )
+
+    # Exactly ONE root.
     parser.add_argument(
-        "--log",
+        "root",
         type=Path,
-        default=None,
+        help="Input directory to process.",
     )
 
     parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
+        help=(
+            "Manifest file path. If omitted, "
+            "refresh_manifest.json is created in "
+            "the current working directory."
+        ),
     )
 
-    return parser
-
-
-def main(
-    argv: Optional[list[str]] = None,
-) -> int:
-    logger.info("refresh started")
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    configure_logging(args.log)
-
-    root = args.path
-
-    manifest_path = (
-        args.manifest
-        if args.manifest is not None
-        else Path.cwd() / "manifest.json"
+    parser.add_argument(
+        "--new-manifest",
+        action="store_true",
+        help=(
+            "Create a new manifest even if the specified "
+            "manifest already exists."
+        ),
     )
-    logger.info(f"manifest file: {manifest_path}")
+
+    parser.add_argument(
+        "--checkpoint",
+        type=int,
+        default=MANIFEST_CHECKPOINT_FILES,
+        help=(
+            "Save manifest every N processed files. "
+            f"Default: {MANIFEST_CHECKPOINT_FILES}"
+        ),
+    )
+
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help=(
+            "Log file path. If omitted, "
+            "refresh.log is created in the current "
+            "working directory."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> int:
+
+    args = parse_args()
+
+    # --------------------------------------------------------
+    # Checkpoint configuration.
+    # --------------------------------------------------------
+
+    if args.checkpoint < 1:
+
+        print(
+            "--checkpoint must be >= 1",
+            file=sys.stderr,
+        )
+
+        return 2
+
+    global MANIFEST_CHECKPOINT_FILES
+
+    MANIFEST_CHECKPOINT_FILES = (
+        args.checkpoint
+    )
+
+    # --------------------------------------------------------
+    # Current working directory.
+    #
+    # This is where default manifest/log files live.
+    # --------------------------------------------------------
+
+    working_dir = Path.cwd()
+
+    # --------------------------------------------------------
+    # Manifest location.
+    # --------------------------------------------------------
+
+    if args.manifest is None:
+
+        manifest_path = (
+            working_dir
+            / DEFAULT_MANIFEST_NAME
+        )
+
+    else:
+
+        manifest_path = args.manifest
+
+    # --------------------------------------------------------
+    # Log location.
+    # --------------------------------------------------------
+
+    if args.log is None:
+
+        log_path = (
+            working_dir
+            / DEFAULT_LOG_NAME
+        )
+
+    else:
+
+        log_path = args.log
+
+    # --------------------------------------------------------
+    # Configure logging BEFORE processing.
+    # --------------------------------------------------------
+
+    setup_logging(
+        log_path
+    )
+
+    logger.info(
+        "Log file: %s",
+        log_path.resolve(),
+    )
+
+    logger.info(
+        "Manifest file: %s",
+        manifest_path.resolve(),
+    )
+
+    logger.info(
+        "Working directory: %s",
+        working_dir.resolve(),
+    )
+
+    # --------------------------------------------------------
+    # Process exactly ONE root.
+    # --------------------------------------------------------
 
     try:
-        logger.info("process started")
-        return process(
-            root,
-            manifest_path,
-            supplied_manifest=args.manifest is not None,
-        )
-        
 
-    except Exception:
-        logger.exception("Fatal error")
-        return 2
+        success = process(
+            root=args.root,
+            manifest_path=manifest_path,
+            create_new_manifest=args.new_manifest,
+        )
+
+        return 0 if success else 1
+
+    except KeyboardInterrupt:
+
+        logger.error(
+            "Process interrupted by user."
+        )
+
+        return 1
+
+    except Exception as exc:
+
+        logger.exception(
+            "Fatal error: %s",
+            exc,
+        )
+
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
-
+    raise SystemExit(
+        main()
+    )
